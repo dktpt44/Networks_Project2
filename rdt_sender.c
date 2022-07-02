@@ -18,6 +18,7 @@
 #define STDIN_FD 0
 #define RETRY 120      // millisecond
 #define WINDOW_SIZE 5  // 5 for now, change to 10
+#define ARRAY_SIZE WINDOW_SIZE * 2
 
 int next_seqno = -1;
 int send_base = -1;
@@ -25,7 +26,7 @@ int send_base = -1;
 /* Variables I added */
 
 int expectedAck = -1;
-tcp_packet *windowPacks[WINDOW_SIZE * 2];
+tcp_packet *windowPacks[ARRAY_SIZE];
 int lastUnAckedPack = 0;  // packet waiting for acknowledgement
 int nextPointer = -1;
 int numUnackedPack = 0;  // ensure this number is less than WINDOW_SIZE
@@ -36,9 +37,6 @@ int sockfd, serverlen;
 struct sockaddr_in serveraddr;
 struct itimerval timer;
 FILE *fp;
-/*
-tcp_packet *sndpkt;
-*/
 tcp_packet *recvpkt;
 sigset_t sigmask;
 
@@ -49,12 +47,13 @@ bool increasePointer() {
   }
   numUnackedPack++;
   nextPointer++;
-  nextPointer %= WINDOW_SIZE;
+  nextPointer %= ARRAY_SIZE;
   return true;
 }
 
 // function that resends unacked packets after a signal
 void resend_packets(int sig) {
+  // send all n packets in the array
   if (sig == SIGALRM) {
     // Resend all packets range between
     // sendBase and nextSeqNum
@@ -141,14 +140,16 @@ int main(int argc, char **argv) {
   // outer loop to run forever
   while (1) {
     // loop to send multiple packets as long as the window size is not full
+    int finalPck = (nextPointer == 0) ? WINDOW_SIZE - 1 : nextPointer - 1;
+
     while (increasePointer()) {
       len = fread(buffer, 1, DATA_SIZE, fp);
 
       // end of file = send empty packet
-      if (len <= 0) {
+      if (len <= 0 && (windowPacks[lastUnAckedPack]->hdr.seqno == windowPacks[finalPck]->hdr.seqno)) {
         VLOG(INFO, "End Of File has been reached");
         nextPointer++;
-        nextPointer %= WINDOW_SIZE;
+        nextPointer %= ARRAY_SIZE;
         windowPacks[nextPointer] = make_packet(0);
         sendto(sockfd, windowPacks[nextPointer], TCP_HDR_SIZE, 0, (const struct sockaddr *)&serveraddr, serverlen);
         break;
@@ -167,7 +168,7 @@ int main(int argc, char **argv) {
         error("sendto");
     }
 
-    if (len <= 0)
+    if (len <= 0 && (windowPacks[lastUnAckedPack]->hdr.seqno == windowPacks[finalPck]->hdr.seqno))
       break;
 
     // Wait for ACK
@@ -175,24 +176,28 @@ int main(int argc, char **argv) {
       start_timer();
       // ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
       // struct sockaddr *src_addr, socklen_t *addrlen);
+      // printf("Exac1: %d\n", expectedAck);
 
       do {
         if (recvfrom(sockfd, buffer, MSS_SIZE, 0, (struct sockaddr *)&serveraddr, (socklen_t *)&serverlen) < 0)
           error("recvfrom");
 
         recvpkt = (tcp_packet *)buffer;
-        printf("%d, for:%d \n", get_data_size(recvpkt), (int)(recvpkt->hdr.ackno / DATA_SIZE) - 1);
         assert(get_data_size(recvpkt) <= DATA_SIZE);
-        free(windowPacks[lastUnAckedPack]);
-        lastUnAckedPack++;
-        lastUnAckedPack %= WINDOW_SIZE;
-        numUnackedPack--;
       } while (recvpkt->hdr.ackno < expectedAck);  // ignore duplicate ACKs
-      stop_timer();
 
       /*resend pack if don't recv ACK */
     } while (recvpkt->hdr.ackno != expectedAck);
-    expectedAck = windowPacks[(lastUnAckedPack + 1) % WINDOW_SIZE]->hdr.seqno;
+    printf("%d, Acked:%d \n", get_data_size(recvpkt), (int)(recvpkt->hdr.ackno / DATA_SIZE) - 1);
+
+    free(windowPacks[lastUnAckedPack]);
+    lastUnAckedPack++;
+    lastUnAckedPack %= ARRAY_SIZE;
+    numUnackedPack--;
+    expectedAck += windowPacks[lastUnAckedPack]->hdr.data_size;
+    stop_timer();
+
+    // printf("Exack: %d\n", expectedAck);
   }
 
   return 0;
