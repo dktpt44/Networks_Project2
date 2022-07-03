@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <math.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -16,7 +17,7 @@
 #include "packet.h"
 
 #define STDIN_FD 0
-#define RETRY 120      // millisecond
+#define RETRY 1200     // millisecond
 #define WINDOW_SIZE 5  // 5 for now, change to 10
 #define ARRAY_SIZE WINDOW_SIZE * 2
 
@@ -57,8 +58,8 @@ void resend_packets(int sig) {
   if (sig == SIGALRM) {
     // Resend all packets range between
     // sendBase and nextSeqNum
-    VLOG(INFO, "Timeout happend");
-    VLOG(DEBUG, "Re-sending pack %d to %s", (int)send_base / (int)DATA_SIZE, inet_ntoa(serveraddr.sin_addr));
+    VLOG(INFO, "Timeout.");
+    VLOG(DEBUG, "Resending pack %d", (int)send_base / (int)DATA_SIZE);
     if (sendto(sockfd, windowPacks[lastUnAckedPack], TCP_HDR_SIZE + get_data_size(windowPacks[lastUnAckedPack]), 0,
                (const struct sockaddr *)&serveraddr, serverlen) < 0) {
       error("sendto");
@@ -129,7 +130,7 @@ void initiateSock(int argc, char **argv) {
 // main function
 int main(int argc, char **argv) {
   initiateSock(argc, argv);
-  int len = 0;
+  int len = 1;  // dummy value does not matter
   char buffer[DATA_SIZE];
   assert(MSS_SIZE - TCP_HDR_SIZE > 0);
 
@@ -140,36 +141,34 @@ int main(int argc, char **argv) {
   // outer loop to run forever
   while (1) {
     // loop to send multiple packets as long as the window size is not full
-    int finalPck = (nextPointer == 0) ? WINDOW_SIZE - 1 : nextPointer - 1;
+    int finalPck = nextPointer;
 
-    while (increasePointer()) {
+    while (len > 0 && increasePointer()) {  // if len < 0, no need to make more packets
       len = fread(buffer, 1, DATA_SIZE, fp);
-
       // end of file = send empty packet
-      if (len <= 0 && (windowPacks[lastUnAckedPack]->hdr.seqno == windowPacks[finalPck]->hdr.seqno)) {
+      if (len <= 0) {
         VLOG(INFO, "End Of File has been reached");
-        nextPointer++;
-        nextPointer %= ARRAY_SIZE;
         windowPacks[nextPointer] = make_packet(0);
+        windowPacks[nextPointer]->hdr.seqno = windowPacks[finalPck]->hdr.seqno + windowPacks[finalPck]->hdr.data_size;
+        VLOG(INFO, "Sending packet last to notify EOF\n");
+
         sendto(sockfd, windowPacks[nextPointer], TCP_HDR_SIZE, 0, (const struct sockaddr *)&serveraddr, serverlen);
         break;
       }
-
+      finalPck = nextPointer;
       // there is data to send = make packets
       send_base = next_seqno;
-      next_seqno = send_base + len;
+      next_seqno += len;
       if (expectedAck == -1)
         expectedAck = next_seqno;
       windowPacks[nextPointer] = make_packet(len);
       memcpy(windowPacks[nextPointer]->data, buffer, len);
       windowPacks[nextPointer]->hdr.seqno = send_base;
-      VLOG(DEBUG, "Sending packet %d to %s", (int)send_base / (int)DATA_SIZE, inet_ntoa(serveraddr.sin_addr));
+      VLOG(DEBUG, "Sending packet %d, seqno:(%d) to %s", (int)send_base / (int)DATA_SIZE, send_base, inet_ntoa(serveraddr.sin_addr));
+
       if (sendto(sockfd, windowPacks[nextPointer], TCP_HDR_SIZE + get_data_size(windowPacks[nextPointer]), 0, (const struct sockaddr *)&serveraddr, serverlen) < 0)
         error("sendto");
     }
-
-    if (len <= 0 && (windowPacks[lastUnAckedPack]->hdr.seqno == windowPacks[finalPck]->hdr.seqno))
-      break;
 
     // Wait for ACK
     do {
@@ -187,14 +186,23 @@ int main(int argc, char **argv) {
       } while (recvpkt->hdr.ackno < expectedAck);  // ignore duplicate ACKs
 
       /*resend pack if don't recv ACK */
+
     } while (recvpkt->hdr.ackno != expectedAck);
-    printf("%d, Acked:%d \n", get_data_size(recvpkt), (int)(recvpkt->hdr.ackno / DATA_SIZE) - 1);
+
+    printf("%d, Ackno: %d, pkt:%d \n", get_data_size(recvpkt), recvpkt->hdr.ackno, (int)(((float)recvpkt->hdr.ackno / (float)DATA_SIZE) - 0.01f));
 
     free(windowPacks[lastUnAckedPack]);
     lastUnAckedPack++;
     lastUnAckedPack %= ARRAY_SIZE;
     numUnackedPack--;
-    expectedAck += windowPacks[lastUnAckedPack]->hdr.data_size;
+    // end of transfer
+    if (len <= 0 && numUnackedPack == 0)
+      break;
+    expectedAck = windowPacks[lastUnAckedPack]->hdr.seqno + windowPacks[lastUnAckedPack]->hdr.data_size;
+    // we are asuming the expected ack for the final empty packet is seqnumber + 1
+    if (windowPacks[lastUnAckedPack]->hdr.data_size == 0)
+      expectedAck++;
+    printf("Expected ack: %d\n", expectedAck);
     stop_timer();
 
     // printf("Exack: %d\n", expectedAck);

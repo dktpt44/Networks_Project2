@@ -30,10 +30,14 @@ void sendAck() {
   sndpkt = make_packet(0);
   // sndpkt->hdr.seqno = recvpkt->hdr.seqno; // added
   sndpkt->hdr.ackno = recvpkt->hdr.seqno + recvpkt->hdr.data_size;
+  // increment ackno by 1 for the final packet
+  if (recvpkt->hdr.data_size == 0)
+    sndpkt->hdr.ackno++;
   sndpkt->hdr.ctr_flags = ACK;
   if (sendto(sockfd, sndpkt, TCP_HDR_SIZE, 0, (struct sockaddr *)&clientaddr, clientlen) < 0) {
     error("ERROR in sendto");
   }
+  printf("sending ack: %d\n", sndpkt->hdr.ackno);
 }
 
 int main(int argc, char **argv) {
@@ -99,27 +103,35 @@ int main(int argc, char **argv) {
 
     recvpkt = (tcp_packet *)buffer;
     assert(get_data_size(recvpkt) <= DATA_SIZE);
-    if (recvpkt->hdr.data_size == 0) {
-      // VLOG(INFO, "End Of File has been reached");
-      fclose(fp);
-      break;
-    }
+
     // discarding out of sequence packets
+    printf("excpt:%d, seqno:%d.\n", expectedSeqno, recvpkt->hdr.seqno);
 
     if (expectedSeqno == recvpkt->hdr.seqno) {
+      if (recvpkt->hdr.data_size == 0) {
+        // VLOG(INFO, "End Of File has been reached");
+        fclose(fp);
+        sendAck();  // sending acknowledgement for the EOF notifier packet
+        break;
+      }
       /*
        * sendto: ACK back to the client
        */
       gettimeofday(&tp, NULL);
-      VLOG(DEBUG, "%lu, %d, %d", tp.tv_sec, recvpkt->hdr.data_size, (int)(recvpkt->hdr.seqno / DATA_SIZE));
+      // note this is not printed if the file size is exactly a multiple for 1456 bytes
+      if (recvpkt->hdr.data_size != 1456) {
+        printf("This is final line.\n");
+      }
+      VLOG(DEBUG, "Writing: %lu, %d, %d", tp.tv_sec, recvpkt->hdr.data_size, (int)(recvpkt->hdr.seqno / DATA_SIZE));
 
       fseek(fp, recvpkt->hdr.seqno, SEEK_SET);
+
       fwrite(recvpkt->data, 1, recvpkt->hdr.data_size, fp);
       sendAck();
       expectedSeqno = sndpkt->hdr.ackno;
-    } else
+    }
 
-    {
+    else {
       // discard the packet but still send the acknowledgement number
       // this is the case when acknowledgement number gets lost
       sendAck();
