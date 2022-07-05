@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
       // note this is not printed if the file size is exactly a multiple for 1456 bytes
       if (recvpkt->hdr.data_size != 1456) {
         printf("This is final line.\n");
+        printf("\n\n%s\n\n", recvpkt->data);
       }
       VLOG(DEBUG, "Writing: %lu, %d, %d", tp.tv_sec, recvpkt->hdr.data_size, (int)(recvpkt->hdr.seqno / DATA_SIZE));
 
