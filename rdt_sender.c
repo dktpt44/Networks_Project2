@@ -17,24 +17,21 @@
 #include "packet.h"
 
 #define STDIN_FD 0
-#define RETRY 1000      // millisecond
-#define WINDOW_SIZE 10  // 5 for now, change to 10
+#define RETRY 150       // millisecond
+#define WINDOW_SIZE 10  // window size
 #define ARRAY_SIZE WINDOW_SIZE * 2
 
-int next_seqno = -1;
-int send_base = -1;
-
-/* Variables I added */
-
+/* Variables added */
 int expectedAck = -1;
 tcp_packet *windowPacks[ARRAY_SIZE];
-tcp_packet *eofPacket;
+tcp_packet *eofPacket;    // Packet to notify EOF, data size = 0
 int lastUnAckedPack = 0;  // packet waiting for acknowledgement
-int nextPointer = -1;
-int numUnackedPack = 0;  // ensure this number is less than WINDOW_SIZE
+int nextPointer = -1;     // pointer that points to the last unacked packet
+int numUnackedPack = 0;   // ensure this number is less than WINDOW_SIZE
+/* */
 
-/*   */
-
+int next_seqno = 0;
+int send_base = -1;
 int sockfd, serverlen, retrial = 0;
 struct sockaddr_in serveraddr;
 struct itimerval timer;
@@ -49,6 +46,7 @@ bool increasePointer() {
   }
   numUnackedPack++;
   nextPointer++;
+  // nextPointer wraparaound
   nextPointer %= ARRAY_SIZE;
   return true;
 }
@@ -58,13 +56,12 @@ void resend_packets(int sig) {
   // send all n packets in the array
   if (sig == SIGALRM) {
     // Resend all packets range between
-    // sendBase and nextSeqNum
     VLOG(INFO, "Timeout.");
     // printf("lastUnacked: %d, numUnacked:%d")
     int upperLim = lastUnAckedPack + numUnackedPack;
     for (int i = lastUnAckedPack; i < upperLim; i++) {
       int packNum = i % WINDOW_SIZE;
-      VLOG(DEBUG, "Resending pack %d", (int)windowPacks[packNum]->hdr.seqno / (int)DATA_SIZE);
+      VLOG(DEBUG, "Resending pack %d, (%d)", windowPacks[packNum]->hdr.seqno, (int)windowPacks[packNum]->hdr.seqno / (int)DATA_SIZE);
       if (sendto(sockfd, windowPacks[packNum], TCP_HDR_SIZE + get_data_size(windowPacks[packNum]), 0, (const struct sockaddr *)&serveraddr, serverlen) < 0) {
         error("sendto");
       }
@@ -141,83 +138,69 @@ int main(int argc, char **argv) {
 
   // Stop and wait protocol
   init_timer(RETRY, resend_packets);
-  next_seqno = 0;
 
   // outer loop to run forever
   while (1) {
     // loop to send multiple packets as long as the window size is not full
-    // int finalPck = nextPointer;
 
     while (len > 0 && increasePointer()) {  // if len < 0, no need to make more packets
       len = fread(buffer, 1, DATA_SIZE, fp);
       // end of file = send empty packet
       if (len <= 0) {
         VLOG(INFO, "End Of File has been reached");
-        // windowPacks[nextPointer] = make_packet(0);
+        // Just make EOF packet, but send it only after all the data has been sent
         eofPacket = make_packet(0);
-
-        // sequence number for the final EOF packet is the size of file
-        // windowPacks[nextPointer]->hdr.seqno = windowPacks[finalPck]->hdr.seqno + windowPacks[finalPck]->hdr.data_size;
         numUnackedPack--;
-
         if (nextPointer == 0)
           nextPointer = ARRAY_SIZE - 1;
         else
           nextPointer--;
-
+        // sequence number for the final EOF packet is the size of file
+        // Here nextpointer holds the last packet
         eofPacket->hdr.seqno = windowPacks[nextPointer]->hdr.seqno + windowPacks[nextPointer]->hdr.data_size;
-        // nextPointer--;
-        // VLOG(INFO, "Sending packet last to notify EOF\n");
-
-        // sendto(sockfd, windowPacks[nextPointer], TCP_HDR_SIZE, 0, (const struct sockaddr *)&serveraddr, serverlen);
         break;
       }
 
       // Else: there is data to send = make packets
-      // finalPck = nextPointer;
       send_base = next_seqno;
       next_seqno += len;
       if (expectedAck == -1)
         expectedAck = next_seqno;
+      // make packet
       windowPacks[nextPointer] = make_packet(len);
+      // copy data to packet
       memcpy(windowPacks[nextPointer]->data, buffer, len);
       windowPacks[nextPointer]->hdr.seqno = send_base;
-      VLOG(DEBUG, "Sending packet %d, seqno:(%d) to %s", (int)send_base / (int)DATA_SIZE, send_base, inet_ntoa(serveraddr.sin_addr));
+      VLOG(DEBUG, "Sending packet %d (%d) to %s", send_base, (int)send_base / (int)DATA_SIZE, inet_ntoa(serveraddr.sin_addr));
 
+      // send packet
       if (sendto(sockfd, windowPacks[nextPointer], TCP_HDR_SIZE + get_data_size(windowPacks[nextPointer]), 0, (const struct sockaddr *)&serveraddr, serverlen) < 0)
         error("sendto");
-    }
+    }  // end while
 
     // Wait for ACK
     start_timer();
     do {
-      // ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
-      // struct sockaddr *src_addr, socklen_t *addrlen);
-      // printf("Exac1: %d\n", expectedAck);
-
-      do {
-        if (recvfrom(sockfd, buffer, MSS_SIZE, 0, (struct sockaddr *)&serveraddr, (socklen_t *)&serverlen) < 0)
-          error("recvfrom");
-
-        recvpkt = (tcp_packet *)buffer;
-        assert(get_data_size(recvpkt) <= DATA_SIZE);
-      } while (recvpkt->hdr.ackno < expectedAck);  // ignore duplicate ACKs
-
-      /*resend pack if don't recv ACK */
-
+      // listen for ack
+      if (recvfrom(sockfd, buffer, MSS_SIZE, 0, (struct sockaddr *)&serveraddr, (socklen_t *)&serverlen) < 0)
+        error("recvfrom");
+      recvpkt = (tcp_packet *)buffer;
+      assert(get_data_size(recvpkt) <= DATA_SIZE);
     } while (recvpkt->hdr.ackno != expectedAck);
 
-    printf("%d, Acked: %d, pkt:%d \n", get_data_size(recvpkt), recvpkt->hdr.ackno, (int)(((float)recvpkt->hdr.ackno / (float)DATA_SIZE) - 0.01f));
+    /* resending of packet if don't recv ACK is handled by timout function */
+    printf("%d, Ack Num: %d, for (%d) \n", get_data_size(recvpkt), recvpkt->hdr.ackno, (int)(((float)recvpkt->hdr.ackno / (float)DATA_SIZE) - 0.01f));
 
     bzero(windowPacks[lastUnAckedPack]->data, sizeof(windowPacks[lastUnAckedPack]->data));
     free(windowPacks[lastUnAckedPack]);
+    // update variables, i.e. slide window
     lastUnAckedPack++;
     lastUnAckedPack %= ARRAY_SIZE;
     numUnackedPack--;
     // end of transfer // no need to ack the EOF packet
     if (len <= 0 && numUnackedPack == 0) {
-      // send eof packet
-      printf("Sending EOF packet. \n");
+      // send eof packet multiple hoping at least one will be sent to receiver
+      printf("\nSending EOF packet and exiting. \n");
       for (int indx1 = 0; indx1 <= 20; indx1++)
         sendto(sockfd, eofPacket, TCP_HDR_SIZE, 0, (const struct sockaddr *)&serveraddr, serverlen);
       break;
